@@ -1,7 +1,13 @@
+import os
 import torch
 import torchaudio
 import gradio as gr
 from os import getenv
+from pydub import AudioSegment
+import re
+import numpy as np
+from datetime import datetime
+from scipy.io import wavfile
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -13,6 +19,23 @@ CURRENT_MODEL = None
 SPEAKER_EMBEDDING = None
 SPEAKER_AUDIO_PATH = None
 
+def split_into_sentence_batches(text, batch_size=2):
+    """Splits text into batches of n sentences."""
+    sentence_endings = re.compile(r'([.!?]["\')\]]*\s+)')
+    parts = sentence_endings.split(text)
+    sentences = []
+    current = ""
+    for i in range(0, len(parts), 2):
+        current += parts[i]
+        if i+1 < len(parts):
+            current += parts[i+1]
+        sentences.append(current.strip())
+        current = ""
+    sentences = [s for s in sentences if s]
+    batches = []
+    for i in range(0, len(sentences), batch_size):
+        batches.append(" ".join(sentences[i:i+batch_size]))
+    return batches
 
 def load_model_if_needed(model_choice: str):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
@@ -27,12 +50,7 @@ def load_model_if_needed(model_choice: str):
         print(f"{model_choice} model loaded successfully!")
     return CURRENT_MODEL
 
-
 def update_ui(model_choice):
-    """
-    Dynamically show/hide UI elements based on the model's conditioners.
-    We do NOT display 'language_id' or 'ctc_loss' even if they exist in the model.
-    """
     model = load_model_if_needed(model_choice)
     cond_names = [c.name for c in model.prefix_conditioner.conditioners]
     print("Conditioners in this model:", cond_names)
@@ -81,10 +99,16 @@ def update_ui(model_choice):
         unconditional_keys_update,
     )
 
+def read_text_file(file_path):
+    if file_path:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return file.read().strip()
+    return None
 
 def generate_audio(
     model_choice,
     text,
+    text_file,
     language,
     speaker_audio,
     prefix_audio,
@@ -103,22 +127,19 @@ def generate_audio(
     dnsmos_ovrl,
     speaker_noised,
     cfg_scale,
-    top_p,
-    top_k,
     min_p,
-    linear,
-    confidence,
-    quadratic,
     seed,
     randomize_seed,
     unconditional_keys,
     progress=gr.Progress(),
 ):
-    """
-    Generates audio based on the provided UI parameters.
-    We do NOT use language_id or ctc_loss even if the model has them.
-    """
     selected_model = load_model_if_needed(model_choice)
+
+    input_text = read_text_file(text_file) if text_file else text
+    if not input_text:
+        raise gr.Error("Please provide text either via textbox or file upload.")
+
+    batches = split_into_sentence_batches(input_text, batch_size=1)
 
     speaker_noised_bool = bool(speaker_noised)
     fmax = float(fmax)
@@ -126,16 +147,10 @@ def generate_audio(
     speaking_rate = float(speaking_rate)
     dnsmos_ovrl = float(dnsmos_ovrl)
     cfg_scale = float(cfg_scale)
-    top_p = float(top_p)
-    top_k = int(top_k)
     min_p = float(min_p)
-    linear = float(linear)
-    confidence = float(confidence)
-    quadratic = float(quadratic)
     seed = int(seed)
     max_new_tokens = 86 * 30
 
-    # This is a bit ew, but works for now.
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
 
     if randomize_seed:
@@ -159,56 +174,93 @@ def generate_audio(
         audio_prefix_codes = selected_model.autoencoder.encode(wav_prefix.unsqueeze(0))
 
     emotion_tensor = torch.tensor(list(map(float, [e1, e2, e3, e4, e5, e6, e7, e8])), device=device)
-
     vq_val = float(vq_single)
     vq_tensor = torch.tensor([vq_val] * 8, device=device).unsqueeze(0)
 
-    cond_dict = make_cond_dict(
-        text=text,
-        language=language,
-        speaker=SPEAKER_EMBEDDING,
-        emotion=emotion_tensor,
-        vqscore_8=vq_tensor,
-        fmax=fmax,
-        pitch_std=pitch_std,
-        speaking_rate=speaking_rate,
-        dnsmos_ovrl=dnsmos_ovrl,
-        speaker_noised=speaker_noised_bool,
-        device=device,
-        unconditional_keys=unconditional_keys,
+    all_audio = []
+    sr_out = None
+
+    for idx, batch_text in enumerate(batches):
+        progress((idx, len(batches)))
+        cond_dict = make_cond_dict(
+            text=batch_text,
+            language=language,
+            speaker=SPEAKER_EMBEDDING,
+            emotion=emotion_tensor,
+            vqscore_8=vq_tensor,
+            fmax=fmax,
+            pitch_std=pitch_std,
+            speaking_rate=speaking_rate,
+            dnsmos_ovrl=dnsmos_ovrl,
+            speaker_noised=speaker_noised_bool,
+            device=device,
+            unconditional_keys=unconditional_keys,
+        )
+        conditioning = selected_model.prepare_conditioning(cond_dict)
+
+        codes = selected_model.generate(
+            prefix_conditioning=conditioning,
+            audio_prefix_codes=audio_prefix_codes,
+            max_new_tokens=max_new_tokens,
+            cfg_scale=cfg_scale,
+            batch_size=1,
+            sampling_params=dict(min_p=min_p),
+            callback=None,
+        )
+
+        wav_out = selected_model.autoencoder.decode(codes).cpu().detach()
+        sr_out = selected_model.autoencoder.sampling_rate
+        if wav_out.dim() == 2 and wav_out.size(0) > 1:
+            wav_out = wav_out[0:1, :]
+        all_audio.append(wav_out.squeeze().numpy())
+
+    final_audio = np.concatenate(all_audio, axis=-1)
+
+    # --- NORMALIZE audio so loudest sample is 98% (avoids digital clipping) ---
+    peak = np.max(np.abs(final_audio))
+    if peak > 0:
+        final_audio = final_audio / peak * 0.98
+
+    # --- NEW: Convert to AudioSegment for compression ---
+    # pydub works with 16-bit PCM, so convert our float32 array to int16
+    audio_int16 = (final_audio * 32767).astype(np.int16)
+
+    # Create AudioSegment from raw data
+    audio_seg = AudioSegment(
+        audio_int16.tobytes(),
+        frame_rate=sr_out,
+        sample_width=2,  # 2 bytes for int16
+        channels=1
     )
-    conditioning = selected_model.prepare_conditioning(cond_dict)
 
-    estimated_generation_duration = 30 * len(text) / 400
-    estimated_total_steps = int(estimated_generation_duration * 86)
-
-    def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
-        progress((step, estimated_total_steps))
-        return True
-
-    codes = selected_model.generate(
-        prefix_conditioning=conditioning,
-        audio_prefix_codes=audio_prefix_codes,
-        max_new_tokens=max_new_tokens,
-        cfg_scale=cfg_scale,
-        batch_size=1,
-        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
-        callback=update_progress,
-        disable_torch_compile=True if "transformer" in model_choice else False,
+    # Apply dynamic range compression
+    # You can adjust threshold/ratio/attack/release as desired
+    audio_seg = audio_seg.compress_dynamic_range(
+        threshold=-20.0,  # dBFS
+        ratio=6.0,
+        attack=5,
+        release=100
     )
+    # Now, apply makeup gain (if you want)
+    audio_seg = audio_seg.apply_gain(5.0)
 
-    wav_out = selected_model.autoencoder.decode(codes).cpu().detach()
-    sr_out = selected_model.autoencoder.sampling_rate
-    if wav_out.dim() == 2 and wav_out.size(0) > 1:
-        wav_out = wav_out[0:1, :]
-    return (sr_out, wav_out.squeeze().numpy()), seed
 
+    # Convert back to numpy for saving
+    compressed_samples = np.array(audio_seg.get_array_of_samples()).astype(np.int16)
+
+    os.makedirs("outputs", exist_ok=True)
+    dt_string = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join("outputs", f"audio_{dt_string}_seed{seed}.wav")
+
+    wavfile.write(output_path, sr_out, compressed_samples)
+    print(f"Audio saved to {output_path}")
+
+    return output_path, seed
 
 def build_interface():
     supported_models = []
     if "transformer" in ZonosBackbone.supported_architectures:
         supported_models.append("Zyphra/Zonos-v0.1-transformer")
-
     if "hybrid" in ZonosBackbone.supported_architectures:
         supported_models.append("Zyphra/Zonos-v0.1-hybrid")
     else:
@@ -230,7 +282,12 @@ def build_interface():
                     label="Text to Synthesize",
                     value="Zonos uses eSpeak for text to phoneme conversion!",
                     lines=4,
-                    max_length=500,  # approximately
+                    max_length=500,
+                )
+                text_file = gr.File(
+                    label="Or Upload Text File (.txt)",
+                    file_types=[".txt"],
+                    type="filepath"
                 )
                 language = gr.Dropdown(
                     choices=supported_language_codes,
@@ -262,22 +319,9 @@ def build_interface():
             with gr.Column():
                 gr.Markdown("## Generation Parameters")
                 cfg_scale_slider = gr.Slider(1.0, 5.0, 2.0, 0.1, label="CFG Scale")
+                min_p_slider = gr.Slider(0.0, 1.0, 0.15, 0.01, label="Min P")
                 seed_number = gr.Number(label="Seed", value=420, precision=0)
                 randomize_seed_toggle = gr.Checkbox(label="Randomize Seed (before generation)", value=True)
-
-        with gr.Accordion("Sampling", open=False):
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### NovelAi's unified sampler")
-                    linear_slider = gr.Slider(-2.0, 2.0, 0.5, 0.01, label="Linear (set to 0 to disable unified sampling)", info="High values make the output less random.")
-                    #Conf's theoretical range is between -2 * Quad and 0.
-                    confidence_slider = gr.Slider(-2.0, 2.0, 0.40, 0.01, label="Confidence", info="Low values make random outputs more random.")
-                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic", info="High values make low probablities much lower.")
-                with gr.Column():
-                    gr.Markdown("### Legacy sampling")
-                    top_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Top P")
-                    min_k_slider = gr.Slider(0.0, 1024, 0, 1, label="Min K")
-                    min_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Min P")
 
         with gr.Accordion("Advanced Parameters", open=False):
             gr.Markdown(
@@ -319,7 +363,7 @@ def build_interface():
 
         with gr.Column():
             generate_button = gr.Button("Generate Audio")
-            output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
+            output_audio = gr.File(label="Download Generated Audio (.wav)")
 
         model_choice.change(
             fn=update_ui,
@@ -347,7 +391,6 @@ def build_interface():
             ],
         )
 
-        # On page load, trigger the same UI refresh
         demo.load(
             fn=update_ui,
             inputs=[model_choice],
@@ -374,12 +417,12 @@ def build_interface():
             ],
         )
 
-        # Generate audio on button click
         generate_button.click(
             fn=generate_audio,
             inputs=[
                 model_choice,
                 text,
+                text_file,
                 language,
                 speaker_audio,
                 prefix_audio,
@@ -398,12 +441,7 @@ def build_interface():
                 dnsmos_slider,
                 speaker_noised_checkbox,
                 cfg_scale_slider,
-                top_p_slider,
-                min_k_slider,
                 min_p_slider,
-                linear_slider,
-                confidence_slider,
-                quadratic_slider,
                 seed_number,
                 randomize_seed_toggle,
                 unconditional_keys,
@@ -413,9 +451,8 @@ def build_interface():
 
     return demo
 
-
 if __name__ == "__main__":
     demo = build_interface()
     share = getenv("GRADIO_SHARE", "False").lower() in ("true", "1", "t")
-    host = getenv("GRADIO_HOST", "0.0.0.0")
-    demo.launch(server_name=host, inbrowser=True, share=share)
+    server_name = getenv("ZONOS_HOST", "0.0.0.0")
+    demo.launch(server_name=server_name, share=share)
