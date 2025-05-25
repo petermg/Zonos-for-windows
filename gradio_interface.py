@@ -77,6 +77,7 @@ def update_ui(model_choice):
         choices=[name for name in cond_names if name not in ("espeak", "language_id")]
     )
 
+    # No updates for compression controls, always visible
     return (
         text_update,
         language_update,
@@ -131,6 +132,12 @@ def generate_audio(
     seed,
     randomize_seed,
     unconditional_keys,
+    compression_enable=True,
+    compression_ratio=6.0,
+    compression_threshold=-20.0,
+    compression_attack=5,
+    compression_release=100,
+    compression_makeup=5,
     progress=gr.Progress(),
 ):
     selected_model = load_model_if_needed(model_choice)
@@ -221,11 +228,9 @@ def generate_audio(
     if peak > 0:
         final_audio = final_audio / peak * 0.98
 
-    # --- NEW: Convert to AudioSegment for compression ---
-    # pydub works with 16-bit PCM, so convert our float32 array to int16
+    # --- Convert to AudioSegment for compression ---
     audio_int16 = (final_audio * 32767).astype(np.int16)
 
-    # Create AudioSegment from raw data
     audio_seg = AudioSegment(
         audio_int16.tobytes(),
         frame_rate=sr_out,
@@ -233,19 +238,15 @@ def generate_audio(
         channels=1
     )
 
-    # Apply dynamic range compression
-    # You can adjust threshold/ratio/attack/release as desired
-    audio_seg = audio_seg.compress_dynamic_range(
-        threshold=-20.0,  # dBFS
-        ratio=6.0,
-        attack=5,
-        release=100
-    )
-    # Now, apply makeup gain (if you want)
-    audio_seg = audio_seg.apply_gain(5.0)
+    if compression_enable:
+        audio_seg = audio_seg.compress_dynamic_range(
+            threshold=float(compression_threshold),
+            ratio=float(compression_ratio),
+            attack=int(compression_attack),
+            release=int(compression_release)
+        )
+        audio_seg = audio_seg.apply_gain(float(compression_makeup))
 
-
-    # Convert back to numpy for saving
     compressed_samples = np.array(audio_seg.get_array_of_samples()).astype(np.int16)
 
     os.makedirs("outputs", exist_ok=True)
@@ -315,6 +316,15 @@ def build_interface():
                 vq_single_slider = gr.Slider(0.5, 0.8, 0.78, 0.01, label="VQ Score")
                 pitch_std_slider = gr.Slider(0.0, 300.0, value=45.0, step=1, label="Pitch Std")
                 speaking_rate_slider = gr.Slider(5.0, 30.0, value=15.0, step=0.5, label="Speaking Rate")
+
+                # Compression controls
+                gr.Markdown("### Audio Compression Controls")
+                compression_enable = gr.Checkbox(label="Enable Compression (pydub)", value=True)
+                compression_ratio = gr.Slider(1.0, 10.0, value=6.0, step=0.1, label="Compression Ratio")
+                compression_threshold = gr.Slider(-60.0, 0.0, value=-40.0, step=0.1, label="Compression Threshold (dBFS)")
+                compression_attack = gr.Slider(1, 200, value=5, step=1, label="Attack (ms)")
+                compression_release = gr.Slider(10, 1000, value=100, step=1, label="Release (ms)")
+                compression_makeup = gr.Slider(0, 20, value=10, step=0.1, label="Makeup Gain (dB)")
 
             with gr.Column():
                 gr.Markdown("## Generation Parameters")
@@ -445,6 +455,12 @@ def build_interface():
                 seed_number,
                 randomize_seed_toggle,
                 unconditional_keys,
+                compression_enable,
+                compression_ratio,
+                compression_threshold,
+                compression_attack,
+                compression_release,
+                compression_makeup,
             ],
             outputs=[output_audio, seed_number],
         )
